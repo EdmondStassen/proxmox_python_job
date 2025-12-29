@@ -3,7 +3,7 @@
 
 set -e
 
-# Community-scripts core inladen (nieuwe locatie / ProxmoxVED)
+# Community-scripts core inladen
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main/misc/build.func)
 
 # ================== BASIS-INFO OVER DE APP ==================
@@ -41,10 +41,7 @@ export HN
 
 # 1) Proxmox LXC root-wachtwoord genereren + eventueel overschrijven
 echo "Er wordt automatisch een sterk root-wachtwoord voor de LXC gegenereerd."
-# 20 tekens, letters/cijfers/symbolen
 GEN_ROOT_PW="$(tr -dc 'A-Za-z0-9!@#$%_-+=' </dev/urandom | head -c 20 || true)"
-
-# fallback als om wat voor reden dan ook GEN_ROOT_PW leeg is
 if [[ -z "$GEN_ROOT_PW" ]]; then
   GEN_ROOT_PW="Pve$(date +%s%N | sha256sum | head -c 12)!"
 fi
@@ -74,8 +71,6 @@ while true; do
     fi
   fi
 done
-
-# NIET exporteren als var_pw / PW, zodat build.func het niet in pct create propt
 export ROOT_PW
 
 # Helper: multi-line geheim (deploy key) inlezen
@@ -134,11 +129,8 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
         echo
         read -rp "Voer je GitHub PAT of volledige HTTPS-URL in: " GIT_INPUT
 
-        # Alleen een PAT-string opgegeven?
         if [[ "$GIT_INPUT" == github_pat_* ]]; then
           GITHUB_PAT="$GIT_INPUT"
-
-          # Repo-naam vragen in vorm user/repo
           REPO_SLUG=""
           while [[ -z "$REPO_SLUG" ]]; do
             read -rp "Voer de repository-naam in als 'user/repo' (bijv. mijnuser/mijnrepo): " REPO_SLUG
@@ -196,7 +188,6 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
         exit 1
       fi
 
-      # Base64-encode van de key op de host (zodat we veilig naar pct exec kunnen)
       DEPLOY_KEY_B64="$(printf '%s' "$DEPLOY_KEY" | base64 -w0)"
       ;;
     *)
@@ -212,13 +203,12 @@ if [[ "$GIT_REPO" =~ github.com[:/]+([^/]+/[^/.]+)(\.git)?$ ]]; then
 fi
 
 if [[ -z "$REPO_NAME" ]]; then
-  # Fallback: expliciet vragen
   read -rp "Kon de repo-naam niet automatisch afleiden, voer in als 'user/repo': " REPO_NAME
 fi
 
 export GIT_AUTH_METHOD GIT_REPO DEPLOY_KEY_B64 REPO_NAME
 
-# Voor weergave in description: geen geheime info lekken
+# Voor weergave in description (geen secrets)
 if [[ "$GIT_AUTH_METHOD" == "https" ]]; then
   REPO_DISPLAY="https://github.com/$REPO_NAME"
 else
@@ -226,10 +216,10 @@ else
 fi
 
 # App specifieke defaults
-APP_DIR="${APP_DIR:-/opt/app}"                # map binnen de container
-PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"     # entrypoint in je repo
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}" # default: elke 6 uur
-UV_BIN="${UV_BIN:-/root/.local/bin/uv}"       # uv-binary pad
+APP_DIR="${APP_DIR:-/opt/app}"
+PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}"
+UV_BIN="${UV_BIN:-/root/.local/bin/uv}"
 
 echo
 echo "Samenvatting invoer:"
@@ -248,7 +238,6 @@ variables
 color
 catch_errors
 
-# Optionele update-functie (standaard-stijl)
 function update_script() {
   header_info "$APP"
   if [[ ! -d /var ]]; then
@@ -286,20 +275,30 @@ post_install_python_uv() {
     DEPLOY_KEY_B64='$DEPLOY_KEY_B64'
 
     if [ \"\$GIT_AUTH_METHOD\" = \"ssh_deploy_key\" ]; then
-      echo \"[INFO] SSH deploy key configureren voor GitHub...\"
+      echo \"[INFO] SSH deploy key configureren voor GitHub (poort 443 via ssh.github.com)...\"
       mkdir -p /root/.ssh
       chmod 700 /root/.ssh
 
       printf '%s' \"\$DEPLOY_KEY_B64\" | base64 -d > /root/.ssh/id_ed25519
       chmod 600 /root/.ssh/id_ed25519
 
+      # SSH config: gebruik ssh.github.com:443 voor github.com
+      cat >/root/.ssh/config <<'EOF'
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  User git
+  IdentityFile /root/.ssh/id_ed25519
+  IdentitiesOnly yes
+EOF
+      chmod 600 /root/.ssh/config
+
       touch /root/.ssh/known_hosts
       if ! grep -q \"github.com\" /root/.ssh/known_hosts 2>/dev/null; then
         ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null || true
       fi
 
-      export GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes'
-      echo \"[INFO] GIT_SSH_COMMAND ingesteld voor gebruik van deploy key.\"
+      echo \"[INFO] SSH config voor github.com ingesteld (via ssh.github.com:443).\"
     fi
 
     # App directory + repo
@@ -379,7 +378,6 @@ Cron: $CRON_SCHEDULE"
     msg_warn "Kon IP niet ophalen voor CT ${CTID} (mogelijk nog geen DHCP lease)."
   fi
 
-  # Root-wachtwoord binnen de container zetten
   if [[ -n "$ROOT_PW" ]]; then
     echo "root:${ROOT_PW}" | pct exec "$CTID" -- chpasswd
     msg_ok "Root-wachtwoord ingesteld binnen de container."
@@ -390,16 +388,16 @@ Cron: $CRON_SCHEDULE"
 
 # ================== CONTAINER MAKEN EN CONFIGUREREN ==================
 start
-build_container          # Maakt de Debian 13 LXC met DHCP (via build.func logica)
-description              # Standaard description
-post_install_python_uv   # Onze extra stappen
+build_container
+description
+post_install_python_uv
 
 msg_ok "Completed Successfully!\n"
-echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
-echo -e "${INFO}${YW} Containernaam/hostname:${CL} ${GN}$HN${CL}"
-echo -e "${INFO}${YW} De container gebruikt DHCP voor zijn IP-adres.${CL}"
-echo -e "${INFO}${YW} Het IP-adres wordt getoond in:${CL}"
-echo -e "${TAB}${NETWORK}${GN}- Proxmox 'Summary / Algemene informatie' (Description)${CL}"
-echo -e "${TAB}${NETWORK}${GN}- /etc/motd binnen de container${CL}"
+echo -e \"${CREATING}${GN}${APP} setup has been successfully initialized!${CL}\"
+echo -e \"${INFO}${YW} Containernaam/hostname:${CL} ${GN}$HN${CL}\"
+echo -e \"${INFO}${YW} De container gebruikt DHCP voor zijn IP-adres.${CL}\"
+echo -e \"${INFO}${YW} Het IP-adres wordt getoond in:${CL}\"
+echo -e \"${TAB}${NETWORK}${GN}- Proxmox 'Summary / Algemene informatie' (Description)${CL}\"
+echo -e \"${TAB}${NETWORK}${GN}- /etc/motd binnen de container${CL}\"
 echo
-echo -e "${INFO}${YW} Root-wachtwoord van de container:${CL} ${GN}$ROOT_PW${CL}"
+echo -e \"${INFO}${YW} Root-wachtwoord van de container:${CL} ${GN}$ROOT_PW${CL}\"
