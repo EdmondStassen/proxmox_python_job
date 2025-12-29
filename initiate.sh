@@ -53,29 +53,29 @@ echo "Voorgesteld root-wachtwoord voor de LXC:"
 echo "  $GEN_ROOT_PW"
 echo
 
+ROOT_PW=""
 while true; do
   read -srp "Druk Enter om dit wachtwoord te gebruiken, of voer een eigen wachtwoord in: " PW1
   echo
   if [[ -z "$PW1" ]]; then
-    # gebruiker accepteert de gegenereerde variant
-    var_pw="$GEN_ROOT_PW"
+    ROOT_PW="$GEN_ROOT_PW"
     echo "Gegenereerd wachtwoord wordt gebruikt."
     break
   else
-    # gebruiker wil eigen wachtwoord -> even dubbel laten invoeren
     read -srp "Herhaal het eigen wachtwoord: " PW2
     echo
     if [[ "$PW1" != "$PW2" ]]; then
       echo "Wachtwoorden komen niet overeen, probeer opnieuw."
     else
-      var_pw="$PW1"
+      ROOT_PW="$PW1"
       echo "Eigen wachtwoord wordt gebruikt."
       break
     fi
   fi
 done
 
-export var_pw
+# NIET exporteren als var_pw / PW, zodat build.func het niet in pct create propt
+export ROOT_PW
 
 # 2) GitHub via PAT / HTTPS URL
 echo
@@ -114,7 +114,6 @@ while [[ -z "$GIT_REPO" ]]; do
     echo "  $GIT_REPO"
     echo
 
-    # Proberen te valideren als git op de host aanwezig is
     if command -v git >/dev/null 2>&1; then
       echo "Controleer toegang tot de repository met dit token..."
       if git ls-remote --heads "$GIT_REPO" >/dev/null 2>&1; then
@@ -130,9 +129,6 @@ while [[ -z "$GIT_REPO" ]]; do
     fi
 
   else
-    # Niet met github_pat_ begonnen → we gaan ervan uit dat het al een volledige URL is
-    # Voorbeeld:
-    #   https://github_pat_...@github.com/user/repo.git
     GIT_REPO="$GIT_INPUT"
     echo
     echo "Ingevoerde Git clone-URL:"
@@ -154,7 +150,99 @@ done
 
 export GIT_REPO
 
-# App specifieke defaults (kun je desnoods nog aanpassen)
+# 3) Interactief JSON plakken voor config-bestanden
+#
+# We gaan vier JSON's opvragen:
+#   - credentials.json
+#   - config.json
+#   - tokens.json
+#   - settings.json
+#
+# Werking:
+#   - Plak je JSON (CTRL+V / Shift+Insert)
+#   - Sluit af met een regel die alleen bevat: __END_JSON__
+#   - Druk Enter
+#
+# Laat je het blok leeg en typ je meteen __END_JSON__, dan wordt dat bestand niet aangemaakt.
+
+prompt_json_block() {
+  local label="$1"
+  local varname="$2"
+  local line json=""
+  echo
+  echo "----------------------------------------------"
+  echo "Plak nu de JSON-inhoud voor: ${label}"
+  echo "Plakken bijv. met CTRL+V."
+  echo "Beëindig met een regel die alleen bevat: __END_JSON__"
+  echo "Voorbeeld:"
+  echo "  {"
+  echo "    \"key\": \"value\""
+  echo "  }"
+  echo "  __END_JSON__"
+  echo "----------------------------------------------"
+  echo
+
+  while IFS= read -r line; do
+    if [[ "$line" == "__END_JSON__" ]]; then
+      break
+    fi
+    json+="$line"$'\n'
+  done
+
+  json="${json%$'\n'}"
+  printf -v "$varname" '%s' "$json"
+}
+
+CREDENTIALS_JSON=""
+CONFIG_JSON=""
+TOKENS_JSON=""
+SETTINGS_JSON=""
+
+echo
+echo "We gaan nu JSON-configuratie voor de app vragen (optioneel)."
+
+prompt_json_block "credentials.json (bijv. service account / credentials_json)" CREDENTIALS_JSON
+prompt_json_block "config.json" CONFIG_JSON
+prompt_json_block "tokens.json" TOKENS_JSON
+prompt_json_block "settings.json" SETTINGS_JSON
+
+# Base64-encode op host zodat we veilig in 'pct exec' kunnen injecteren
+CREDENTIALS_JSON_B64=""
+CONFIG_JSON_B64=""
+TOKENS_JSON_B64=""
+SETTINGS_JSON_B64=""
+
+if [[ -n "$CREDENTIALS_JSON" ]]; then
+  CREDENTIALS_JSON_B64="$(printf '%s' "$CREDENTIALS_JSON" | base64 -w0)"
+  echo "  - credentials.json zal worden aangemaakt in de container."
+else
+  echo "  - credentials.json wordt NIET aangemaakt."
+fi
+
+if [[ -n "$CONFIG_JSON" ]]; then
+  CONFIG_JSON_B64="$(printf '%s' "$CONFIG_JSON" | base64 -w0)"
+  echo "  - config.json zal worden aangemaakt in de container."
+else
+  echo "  - config.json wordt NIET aangemaakt."
+fi
+
+if [[ -n "$TOKENS_JSON" ]]; then
+  TOKENS_JSON_B64="$(printf '%s' "$TOKENS_JSON" | base64 -w0)"
+  echo "  - tokens.json zal worden aangemaakt in de container."
+else
+  echo "  - tokens.json wordt NIET aangemaakt."
+fi
+
+if [[ -n "$SETTINGS_JSON" ]]; then
+  SETTINGS_JSON_B64="$(printf '%s' "$SETTINGS_JSON" | base64 -w0)"
+  echo "  - settings.json zal worden aangemaakt in de container."
+else
+  echo "  - settings.json wordt NIET aangemaakt."
+fi
+
+export CREDENTIALS_JSON_B64 CONFIG_JSON_B64 TOKENS_JSON_B64 SETTINGS_JSON_B64
+
+# App specifieke defaults
 APP_DIR="${APP_DIR:-/opt/app}"                # map binnen de container
 PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"     # entrypoint in je repo
 CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}" # default: elke 6 uur
@@ -163,7 +251,7 @@ UV_BIN="${UV_BIN:-/root/.local/bin/uv}"       # uv-binary pad
 echo
 echo "Samenvatting invoer:"
 echo "  - Containernaam   : $HN"
-echo "  - Root wachtwoord : $var_pw"
+echo "  - Root wachtwoord : $ROOT_PW"
 echo "  - GitHub URL      : $GIT_REPO"
 echo "  - App directory   : $APP_DIR"
 echo "  - Script          : $PYTHON_SCRIPT"
@@ -191,11 +279,10 @@ function update_script() {
   exit 0
 }
 
-# ================== POST-INSTALL: UV + GIT + CRON + IP ==================
+# ================== POST-INSTALL: UV + GIT + CRON + CONFIG ==================
 post_install_python_uv() {
-  msg_info "Configureer uv, GitHub repo en cron in CT ${CTID}"
+  msg_info "Configureer uv, GitHub repo, config en cron in CT ${CTID}"
 
-  # Binnen de container: uv, repo, cron
   pct exec "$CTID" -- bash -c "
     set -e
 
@@ -237,6 +324,45 @@ post_install_python_uv() {
       echo \"[WARN] 'uv sync' wordt overgeslagen.\"
     fi
 
+    # ======== CONFIG MAP EN JSON-BESTANDEN AANMAKEN VANUIT B64-SECRETS ========
+    CONFIG_DIR=\"$APP_DIR/config\"
+    mkdir -p \"\$CONFIG_DIR\"
+
+    CREDENTIALS_JSON_B64='$CREDENTIALS_JSON_B64'
+    CONFIG_JSON_B64='$CONFIG_JSON_B64'
+    TOKENS_JSON_B64='$TOKENS_JSON_B64'
+    SETTINGS_JSON_B64='$SETTINGS_JSON_B64'
+
+    if [ -n \"\$CREDENTIALS_JSON_B64\" ]; then
+      printf '%s' \"\$CREDENTIALS_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/credentials.json\"
+      echo \"[INFO] credentials.json geschreven in \$CONFIG_DIR\"
+    else
+      echo \"[INFO] Geen credentials JSON doorgegeven; credentials.json wordt niet aangemaakt.\"
+    fi
+
+    if [ -n \"\$CONFIG_JSON_B64\" ]; then
+      printf '%s' \"\$CONFIG_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/config.json\"
+      echo \"[INFO] config.json geschreven in \$CONFIG_DIR\"
+    else
+      echo \"[INFO] Geen config JSON doorgegeven; config.json wordt niet aangemaakt.\"
+    fi
+
+    if [ -n \"\$TOKENS_JSON_B64\" ]; then
+      printf '%s' \"\$TOKENS_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/tokens.json\"
+      echo \"[INFO] tokens.json geschreven in \$CONFIG_DIR\"
+    else
+      echo \"[INFO] Geen tokens JSON doorgegeven; tokens.json wordt niet aangemaakt.\"
+    fi
+
+    if [ -n \"\$SETTINGS_JSON_B64\" ]; then
+      printf '%s' \"\$SETTINGS_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/settings.json\"
+      echo \"[INFO] settings.json geschreven in \$CONFIG_DIR\"
+    else
+      echo \"[INFO] Geen settings JSON doorgegeven; settings.json wordt niet aangemaakt.\"
+    fi
+
+    # ========================================================================
+
     # Log-directory
     mkdir -p /var/log/python-job
 
@@ -259,7 +385,7 @@ $CRON_SCHEDULE cd $APP_DIR && $UV_BIN sync && $UV_BIN run $PYTHON_SCRIPT >> /var
     fi
   "
 
-  msg_ok "uv, repo en cron zijn in de container geconfigureerd"
+  msg_ok "uv, repo, config en cron zijn in de container geconfigureerd"
 
   # IP-adres ophalen (met wat retries voor DHCP)
   IP=""
@@ -277,7 +403,7 @@ $CRON_SCHEDULE cd $APP_DIR && $UV_BIN sync && $UV_BIN run $PYTHON_SCRIPT >> /var
 Hostname: $HN
 IP address: $IP
 
-Root password: $var_pw
+Root password: $ROOT_PW
 
 Repo: $GIT_REPO
 Script: $PYTHON_SCRIPT
@@ -285,6 +411,14 @@ Cron: $CRON_SCHEDULE"
     msg_ok "Container description bijgewerkt met hostname en IP: $IP"
   else
     msg_warn "Kon IP niet ophalen voor CT ${CTID} (mogelijk nog geen DHCP lease)."
+  fi
+
+  # Root-wachtwoord binnen de container zetten
+  if [[ -n "$ROOT_PW" ]]; then
+    echo "root:${ROOT_PW}" | pct exec "$CTID" -- chpasswd
+    msg_ok "Root-wachtwoord ingesteld binnen de container."
+  else
+    msg_warn "ROOT_PW is leeg; root-wachtwoord niet ingesteld in de container."
   fi
 }
 
@@ -302,4 +436,4 @@ echo -e "${INFO}${YW} Het IP-adres wordt getoond in:${CL}"
 echo -e "${TAB}${NETWORK}${GN}- Proxmox 'Summary / Algemene informatie' (Description)${CL}"
 echo -e "${TAB}${NETWORK}${GN}- /etc/motd binnen de container${CL}"
 echo
-echo -e "${INFO}${YW} Root-wachtwoord van de container:${CL} ${GN}$var_pw${CL}"
+echo -e "${INFO}${YW} Root-wachtwoord van de container:${CL} ${GN}$ROOT_PW${CL}"
