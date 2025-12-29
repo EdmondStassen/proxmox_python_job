@@ -2,18 +2,20 @@
 # Gebaseerd op: https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/debian.sh
 # Draait op de Proxmox host
 
+set -e
+
 # Community-scripts core inladen
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
 # ================== BASIS-INFO OVER DE APP ==================
 APP="Python uv cron"
-var_tags="${var_tags:-python;uv;cron}"     # tags voor in Proxmox
-var_cpu="${var_cpu:-1}"                    # CPU cores
-var_ram="${var_ram:-512}"                  # RAM in MB
-var_disk="${var_disk:-4}"                  # Disk in GB
-var_os="${var_os:-debian}"                 # debian/ubuntu/alpine
-var_version="${var_version:-13}"           # Debian 13
-var_unprivileged="${var_unprivileged:-1}"  # unprivileged LXC
+var_tags="${var_tags:-python;uv;cron}"
+var_cpu="${var_cpu:-1}"
+var_ram="${var_ram:-512}"
+var_disk="${var_disk:-4}"
+var_os="${var_os:-debian}"
+var_version="${var_version:-13}"
+var_unprivileged="${var_unprivileged:-1}"
 
 # ================== INTERACTIEVE VRAGEN ==================
 
@@ -29,7 +31,6 @@ while true; do
   read -rp "Naam/hostname voor de nieuwe container [${DEFAULT_HN}]: " INPUT_HN
   HN="${INPUT_HN:-$DEFAULT_HN}"
 
-  # eenvoudige validatie: letters, cijfers en koppeltekens, begint met letter/cijfer
   if [[ "$HN" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
     break
   else
@@ -38,18 +39,13 @@ while true; do
 done
 export HN
 
-# 1) Proxmox LXC root-wachtwoord genereren + eventueel overschrijven
+# 1) Root wachtwoord
 echo "Er wordt automatisch een sterk root-wachtwoord voor de LXC gegenereerd."
-# 20 tekens, letters/cijfers/symbolen
 GEN_ROOT_PW="$(tr -dc 'A-Za-z0-9!@#$%_-+=' </dev/urandom | head -c 20 || true)"
-
-# fallback als om wat voor reden dan ook GEN_ROOT_PW leeg is
-if [[ -z "$GEN_ROOT_PW" ]]; then
-  GEN_ROOT_PW="Pve$(date +%s%N | sha256sum | head -c 12)!"
-fi
+[[ -z "$GEN_ROOT_PW" ]] && GEN_ROOT_PW="Pve$(date +%s%N | sha256sum | head -c 12)!"
 
 echo
-echo "Voorgesteld root-wachtwoord voor de LXC:"
+echo "Voorgesteld root-wachtwoord:"
 echo "  $GEN_ROOT_PW"
 echo
 
@@ -73,198 +69,156 @@ while true; do
     fi
   fi
 done
-
-# NIET exporteren als var_pw / PW, zodat build.func het niet in pct create propt
 export ROOT_PW
 
-# 2) GitHub via PAT / HTTPS URL
-echo
-echo "Repository toegang via GitHub Personal Access Token (PAT) over HTTPS."
-echo
-echo "Je kunt hier één van de twee opties gebruiken:"
-echo
-echo "  Voorbeeld 1 - ALLEEN PAT-string:"
-echo "    github_pat_..."
-echo
-echo "  Voorbeeld 2 - Volledige HTTPS-URL met PAT:"
-echo "    https://github_pat_...@github.com/user/repo.git"
-echo
-
-GIT_REPO=""
-while [[ -z "$GIT_REPO" ]]; do
-  read -rp "Voer je GitHub PAT of volledige HTTPS-URL in: " GIT_INPUT
-
-  # Alleen een PAT-string opgegeven?
-  if [[ "$GIT_INPUT" == github_pat_* ]]; then
-    GITHUB_PAT="$GIT_INPUT"
-
-    # Repo-naam vragen in vorm user/repo
-    REPO_SLUG=""
-    while [[ -z "$REPO_SLUG" ]]; do
-      read -rp "Voer de repository-naam in als 'user/repo' (bijv. mijnuser/mijnrepo): " REPO_SLUG
-      if [[ "$REPO_SLUG" != */* ]]; then
-        echo "Formaat ongeldig. Gebruik 'user/repo'."
-        REPO_SLUG=""
-      fi
-    done
-
-    GIT_REPO="https://$GITHUB_PAT@github.com/$REPO_SLUG.git"
-    echo
-    echo "Gegenereerde HTTPS-URL op basis van PAT:"
-    echo "  $GIT_REPO"
-    echo
-
-    if command -v git >/dev/null 2>&1; then
-      echo "Controleer toegang tot de repository met dit token..."
-      if git ls-remote --heads "$GIT_REPO" >/dev/null 2>&1; then
-        echo "✅ Token en repository lijken geldig."
-      else
-        echo "❌ FOUT: kan de repository niet benaderen met dit token/URL."
-        echo "   - Klopt de repo-naam (user/repo)?"
-        echo "   - Heeft de PAT voldoende rechten (Contents: read)?"
-        exit 1
-      fi
-    else
-      echo "Let op: 'git' is niet beschikbaar op de host, URL kan niet vooraf online gevalideerd worden."
-    fi
-
-  else
-    GIT_REPO="$GIT_INPUT"
-    echo
-    echo "Ingevoerde Git clone-URL:"
-    echo "  $GIT_REPO"
-    echo
-
-    if command -v git >/dev/null 2>&1; then
-      echo "Controleer toegang tot de repository met deze URL..."
-      if git ls-remote --heads "$GIT_REPO" >/dev/null 2>&1; then
-        echo "✅ URL en toegang lijken geldig."
-      else
-        echo "❌ FOUT: kan de repository niet benaderen met deze URL."
-        echo "   - Controleer PAT, rechten en repositorynaam."
-        exit 1
-      fi
-    fi
-  fi
-done
-
-export GIT_REPO
-
-# 3) Interactief JSON plakken voor config-bestanden
-#
-# We gaan vier JSON's opvragen:
-#   - credentials.json
-#   - config.json
-#   - tokens.json
-#   - settings.json
-#
-# Werking:
-#   - Plak je JSON (CTRL+V / Shift+Insert)
-#   - Sluit af met een regel die alleen bevat: __END_JSON__
-#   - Druk Enter
-#
-# Laat je het blok leeg en typ je meteen __END_JSON__, dan wordt dat bestand niet aangemaakt.
-
-prompt_json_block() {
+# Helper: multi-line geheim (deploy key) inlezen
+prompt_multiline_secret() {
   local label="$1"
   local varname="$2"
-  local line json=""
+  local line data=""
   echo
   echo "----------------------------------------------"
-  echo "Plak nu de JSON-inhoud voor: ${label}"
-  echo "Plakken bijv. met CTRL+V."
-  echo "Beëindig met een regel die alleen bevat: __END_JSON__"
-  echo "Voorbeeld:"
-  echo "  {"
-  echo "    \"key\": \"value\""
-  echo "  }"
-  echo "  __END_JSON__"
+  echo "Plak nu de ${label}."
+  echo "Beëindig met een regel die alleen bevat: __END_KEY__"
   echo "----------------------------------------------"
   echo
 
   while IFS= read -r line; do
-    if [[ "$line" == "__END_JSON__" ]]; then
+    if [[ "$line" == "__END_KEY__" ]]; then
       break
     fi
-    json+="$line"$'\n'
+    data+="$line"$'\n'
   done
 
-  json="${json%$'\n'}"
-  printf -v "$varname" '%s' "$json"
+  data="${data%$'\n'}"
+  printf -v "$varname" '%s' "$data"
 }
 
-CREDENTIALS_JSON=""
-CONFIG_JSON=""
-TOKENS_JSON=""
-SETTINGS_JSON=""
-
+# 2) GitHub repo / authenticatiemethode
 echo
-echo "We gaan nu JSON-configuratie voor de app vragen (optioneel)."
+echo "Repository toegang via GitHub:"
+echo
+echo "  [1] GitHub PAT of HTTPS-URL (bestaande methode)"
+echo "  [2] Deploy key (SSH) + SSH clone-URL (git@github.com:user/repo.git)"
+echo
 
-prompt_json_block "credentials.json (bijv. service account / credentials_json)" CREDENTIALS_JSON
-prompt_json_block "config.json" CONFIG_JSON
-prompt_json_block "tokens.json" TOKENS_JSON
-prompt_json_block "settings.json" SETTINGS_JSON
+GIT_AUTH_METHOD=""
+GIT_REPO=""
+DEPLOY_KEY=""
+DEPLOY_KEY_B64=""
 
-# Base64-encode op host zodat we veilig in 'pct exec' kunnen injecteren
-CREDENTIALS_JSON_B64=""
-CONFIG_JSON_B64=""
-TOKENS_JSON_B64=""
-SETTINGS_JSON_B64=""
+while [[ -z "$GIT_AUTH_METHOD" ]]; do
+  read -rp "Kies authenticatiemethode [1/2]: " AUTH_CHOICE
+  case "$AUTH_CHOICE" in
+    1)
+      GIT_AUTH_METHOD="https"
+      echo
+      echo "Je hebt gekozen voor: PAT / HTTPS-URL"
+      echo
+      while [[ -z "$GIT_REPO" ]]; do
+        read -rp "Voer je GitHub PAT of volledige HTTPS-URL in: " GIT_INPUT
 
-if [[ -n "$CREDENTIALS_JSON" ]]; then
-  CREDENTIALS_JSON_B64="$(printf '%s' "$CREDENTIALS_JSON" | base64 -w0)"
-  echo "  - credentials.json zal worden aangemaakt in de container."
-else
-  echo "  - credentials.json wordt NIET aangemaakt."
+        if [[ "$GIT_INPUT" == github_pat_* ]]; then
+          GITHUB_PAT="$GIT_INPUT"
+
+          REPO_SLUG=""
+          while [[ -z "$REPO_SLUG" ]]; do
+            read -rp "Voer de repository-naam in als 'user/repo' (bijv. mijnuser/mijnrepo): " REPO_SLUG
+            if [[ "$REPO_SLUG" != */* ]]; then
+              echo "Formaat ongeldig. Gebruik 'user/repo'."
+              REPO_SLUG=""
+            fi
+          done
+
+          GIT_REPO="https://$GITHUB_PAT@github.com/$REPO_SLUG.git"
+          echo
+          echo "Gegenereerde HTTPS-URL op basis van PAT:"
+          echo "  $GIT_REPO"
+          echo
+        else
+          GIT_REPO="$GIT_INPUT"
+          echo
+          echo "Ingevoerde Git clone-URL:"
+          echo "  $GIT_REPO"
+          echo
+        fi
+
+        if command -v git >/dev/null 2>&1; then
+          echo "Controleer toegang tot de repository met deze URL..."
+          if git ls-remote --heads "$GIT_REPO" >/dev/null 2>&1; then
+            echo "✅ URL en toegang lijken geldig."
+          else
+            echo "❌ FOUT: kan de repository niet benaderen met deze URL."
+            echo "   - Controleer PAT, rechten en repositorynaam."
+            GIT_REPO=""
+          fi
+        else
+          echo "Let op: 'git' is niet beschikbaar op de host, URL kan niet vooraf gevalideerd worden."
+        fi
+      done
+      ;;
+    2)
+      GIT_AUTH_METHOD="ssh_deploy_key"
+      echo
+      echo "Je hebt gekozen voor: Deploy key (SSH)."
+      echo "Zorg dat de public key als *deploy key* in GitHub op de repo staat."
+      echo
+
+      while [[ -z "$GIT_REPO" ]]; do
+        read -rp "Voer de SSH clone-URL in (bijv. git@github.com:user/repo.git): " GIT_REPO
+        if [[ -z "$GIT_REPO" ]]; then
+          echo "SSH clone-URL mag niet leeg zijn."
+        fi
+      done
+
+      prompt_multiline_secret "private deploy key (begint met '-----BEGIN ... PRIVATE KEY-----')" DEPLOY_KEY
+
+      if [[ -z "$DEPLOY_KEY" ]]; then
+        echo "Deploy key is leeg; kan niet doorgaan met SSH deploy key."
+        exit 1
+      fi
+
+      # Base64-encode van de key op de host (zodat we veilig naar pct exec kunnen)
+      DEPLOY_KEY_B64="$(printf '%s' "$DEPLOY_KEY" | base64 -w0)"
+      ;;
+    *)
+      echo "Ongeldige keuze, kies 1 of 2."
+      ;;
+  esac
+done
+
+export GIT_AUTH_METHOD GIT_REPO DEPLOY_KEY_B64
+
+# Voor weergave in description: geen geheime info lekken
+REPO_DISPLAY="$GIT_REPO"
+if [[ "$GIT_AUTH_METHOD" == "https" && "$GIT_REPO" == https://github_pat_*@github.com/* ]]; then
+  # PAT afschermen
+  REPO_DISPLAY="https://github_pat_***@github.com/${GIT_REPO#https://github_pat_*@github.com/}"
 fi
-
-if [[ -n "$CONFIG_JSON" ]]; then
-  CONFIG_JSON_B64="$(printf '%s' "$CONFIG_JSON" | base64 -w0)"
-  echo "  - config.json zal worden aangemaakt in de container."
-else
-  echo "  - config.json wordt NIET aangemaakt."
-fi
-
-if [[ -n "$TOKENS_JSON" ]]; then
-  TOKENS_JSON_B64="$(printf '%s' "$TOKENS_JSON" | base64 -w0)"
-  echo "  - tokens.json zal worden aangemaakt in de container."
-else
-  echo "  - tokens.json wordt NIET aangemaakt."
-fi
-
-if [[ -n "$SETTINGS_JSON" ]]; then
-  SETTINGS_JSON_B64="$(printf '%s' "$SETTINGS_JSON" | base64 -w0)"
-  echo "  - settings.json zal worden aangemaakt in de container."
-else
-  echo "  - settings.json wordt NIET aangemaakt."
-fi
-
-export CREDENTIALS_JSON_B64 CONFIG_JSON_B64 TOKENS_JSON_B64 SETTINGS_JSON_B64
 
 # App specifieke defaults
-APP_DIR="${APP_DIR:-/opt/app}"                # map binnen de container
-PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"     # entrypoint in je repo
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}" # default: elke 6 uur
-UV_BIN="${UV_BIN:-/root/.local/bin/uv}"       # uv-binary pad
+APP_DIR="${APP_DIR:-/opt/app}"
+PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}"
+UV_BIN="${UV_BIN:-/root/.local/bin/uv}"
 
 echo
 echo "Samenvatting invoer:"
 echo "  - Containernaam   : $HN"
 echo "  - Root wachtwoord : $ROOT_PW"
-echo "  - GitHub URL      : $GIT_REPO"
+echo "  - Git methode     : $GIT_AUTH_METHOD"
+echo "  - Git repo        : $REPO_DISPLAY"
 echo "  - App directory   : $APP_DIR"
 echo "  - Script          : $PYTHON_SCRIPT"
 echo "  - Cron schedule   : $CRON_SCHEDULE"
 echo
 
-# ================== STANDAARD COMMUNITY-SCRIPTS FLOW ==================
+# ================== STANDAARD COMMUNITY FLOW ==================
 header_info "$APP"
 variables
 color
 catch_errors
 
-# Optionele update-functie (standaard-stijl)
 function update_script() {
   header_info "$APP"
   if [[ ! -d /var ]]; then
@@ -279,9 +233,9 @@ function update_script() {
   exit 0
 }
 
-# ================== POST-INSTALL: UV + GIT + CRON + CONFIG ==================
+# ================== POST-INSTALL ==================
 post_install_python_uv() {
-  msg_info "Configureer uv, GitHub repo, config en cron in CT ${CTID}"
+  msg_info "Configureer uv, GitHub repo en cron in CT ${CTID}"
 
   pct exec "$CTID" -- bash -c "
     set -e
@@ -289,21 +243,42 @@ post_install_python_uv() {
     # Basis packages
     apt-get update
     apt-get -y upgrade
-    apt-get install -y git curl python3 python3-distutils cron
+    apt-get install -y git curl python3 python3-distutils cron openssh-client
 
     # uv installeren (indien nog niet aanwezig)
     if [ ! -x '$UV_BIN' ]; then
       curl -LsSf https://astral.sh/uv/install.sh | sh
     fi
 
-    # Repo-URL (zoals opgegeven op de host)
+    # Git auth configureren
+    GIT_AUTH_METHOD='$GIT_AUTH_METHOD'
     REPO_URL='$GIT_REPO'
+
+    if [ \"\$GIT_AUTH_METHOD\" = \"ssh_deploy_key\" ]; then
+      echo \"[INFO] SSH deploy key configureren voor GitHub...\"
+      mkdir -p /root/.ssh
+      chmod 700 /root/.ssh
+
+      DEPLOY_KEY_B64='$DEPLOY_KEY_B64'
+      printf '%s' \"\$DEPLOY_KEY_B64\" | base64 -d > /root/.ssh/id_ed25519
+      chmod 600 /root/.ssh/id_ed25519
+
+      touch /root/.ssh/known_hosts
+      if ! grep -q \"github.com\" /root/.ssh/known_hosts 2>/dev/null; then
+        ssh-keyscan -H github.com >> /root/.ssh/known_hosts 2>/dev/null || true
+      fi
+
+      export GIT_SSH_COMMAND='ssh -i /root/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes'
+      echo \"[INFO] GIT_SSH_COMMAND ingesteld voor gebruik van deploy key.\"
+    fi
 
     # App directory + repo
     mkdir -p '$APP_DIR'
     if [ ! -d '$APP_DIR/.git' ]; then
+      echo \"[INFO] Clone van repo: \$REPO_URL\"
       git clone \"\$REPO_URL\" '$APP_DIR'
     else
+      echo \"[INFO] Bestaande repo gevonden, voer git pull uit...\"
       cd '$APP_DIR'
       git pull
     fi
@@ -312,56 +287,12 @@ post_install_python_uv() {
 
     # Dependencies controleren en evt. syncen via uv
     if [ -f \"pyproject.toml\" ] || [ -f \"requirements.txt\" ] || [ -f \"requirements.in\" ]; then
-      echo \"[INFO] Dependency-bestanden gevonden in $APP_DIR:\"
-      [ -f \"pyproject.toml\" ]   && echo \"  - pyproject.toml\"
-      [ -f \"requirements.txt\" ] && echo \"  - requirements.txt\"
-      [ -f \"requirements.in\" ]  && echo \"  - requirements.in\"
-
-      echo \"[INFO] Voer 'uv sync' uit...\"
+      echo \"[INFO] Dependency-bestanden gevonden in $APP_DIR, voer 'uv sync' uit...\"
       '$UV_BIN' sync
     else
       echo \"[WARN] Geen pyproject.toml, requirements.txt of requirements.in gevonden in $APP_DIR\"
       echo \"[WARN] 'uv sync' wordt overgeslagen.\"
     fi
-
-    # ======== CONFIG MAP EN JSON-BESTANDEN AANMAKEN VANUIT B64-SECRETS ========
-    CONFIG_DIR=\"$APP_DIR/config\"
-    mkdir -p \"\$CONFIG_DIR\"
-
-    CREDENTIALS_JSON_B64='$CREDENTIALS_JSON_B64'
-    CONFIG_JSON_B64='$CONFIG_JSON_B64'
-    TOKENS_JSON_B64='$TOKENS_JSON_B64'
-    SETTINGS_JSON_B64='$SETTINGS_JSON_B64'
-
-    if [ -n \"\$CREDENTIALS_JSON_B64\" ]; then
-      printf '%s' \"\$CREDENTIALS_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/credentials.json\"
-      echo \"[INFO] credentials.json geschreven in \$CONFIG_DIR\"
-    else
-      echo \"[INFO] Geen credentials JSON doorgegeven; credentials.json wordt niet aangemaakt.\"
-    fi
-
-    if [ -n \"\$CONFIG_JSON_B64\" ]; then
-      printf '%s' \"\$CONFIG_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/config.json\"
-      echo \"[INFO] config.json geschreven in \$CONFIG_DIR\"
-    else
-      echo \"[INFO] Geen config JSON doorgegeven; config.json wordt niet aangemaakt.\"
-    fi
-
-    if [ -n \"\$TOKENS_JSON_B64\" ]; then
-      printf '%s' \"\$TOKENS_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/tokens.json\"
-      echo \"[INFO] tokens.json geschreven in \$CONFIG_DIR\"
-    else
-      echo \"[INFO] Geen tokens JSON doorgegeven; tokens.json wordt niet aangemaakt.\"
-    fi
-
-    if [ -n \"\$SETTINGS_JSON_B64\" ]; then
-      printf '%s' \"\$SETTINGS_JSON_B64\" | base64 -d > \"\$CONFIG_DIR/settings.json\"
-      echo \"[INFO] settings.json geschreven in \$CONFIG_DIR\"
-    else
-      echo \"[INFO] Geen settings JSON doorgegeven; settings.json wordt niet aangemaakt.\"
-    fi
-
-    # ========================================================================
 
     # Log-directory
     mkdir -p /var/log/python-job
@@ -385,7 +316,7 @@ $CRON_SCHEDULE cd $APP_DIR && $UV_BIN sync && $UV_BIN run $PYTHON_SCRIPT >> /var
     fi
   "
 
-  msg_ok "uv, repo, config en cron zijn in de container geconfigureerd"
+  msg_ok "uv, repo en cron zijn in de container geconfigureerd"
 
   # IP-adres ophalen (met wat retries voor DHCP)
   IP=""
@@ -397,6 +328,7 @@ $CRON_SCHEDULE cd $APP_DIR && $UV_BIN sync && $UV_BIN run $PYTHON_SCRIPT >> /var
     sleep 3
   done
 
+  # Description zonder secrets
   if [[ -n "$IP" ]]; then
     pct set "$CTID" -description "Python uv cron container
 
@@ -405,7 +337,7 @@ IP address: $IP
 
 Root password: $ROOT_PW
 
-Repo: $GIT_REPO
+Repo: $REPO_DISPLAY
 Script: $PYTHON_SCRIPT
 Cron: $CRON_SCHEDULE"
     msg_ok "Container description bijgewerkt met hostname en IP: $IP"
@@ -424,16 +356,6 @@ Cron: $CRON_SCHEDULE"
 
 # ================== CONTAINER MAKEN EN CONFIGUREREN ==================
 start
-build_container          # Maakt de Debian 13 LXC met DHCP (via build.func logica)
-description              # Standaard description
-post_install_python_uv   # Onze extra stappen
-
-msg_ok "Completed Successfully!\n"
-echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
-echo -e "${INFO}${YW} Containernaam/hostname:${CL} ${GN}$HN${CL}"
-echo -e "${INFO}${YW} De container gebruikt DHCP voor zijn IP-adres.${CL}"
-echo -e "${INFO}${YW} Het IP-adres wordt getoond in:${CL}"
-echo -e "${TAB}${NETWORK}${GN}- Proxmox 'Summary / Algemene informatie' (Description)${CL}"
-echo -e "${TAB}${NETWORK}${GN}- /etc/motd binnen de container${CL}"
-echo
-echo -e "${INFO}${YW} Root-wachtwoord van de container:${CL} ${GN}$ROOT_PW${CL}"
+build_container          # Maakt de Debian LXC met DHCP (via build.func logica)
+description              # Standaard description (wordt later overschreven)
+post_install_python_uv_
