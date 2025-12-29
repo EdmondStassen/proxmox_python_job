@@ -2,20 +2,18 @@
 # Gebaseerd op: https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/debian.sh
 # Draait op de Proxmox host
 
-set -e
-
 # Community-scripts core inladen
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
 # ================== BASIS-INFO OVER DE APP ==================
 APP="Python uv cron"
-var_tags="${var_tags:-python;uv;cron}"
-var_cpu="${var_cpu:-1}"
-var_ram="${var_ram:-512}"
-var_disk="${var_disk:-4}"
-var_os="${var_os:-debian}"
-var_version="${var_version:-13}"
-var_unprivileged="${var_unprivileged:-1}"
+var_tags="${var_tags:-python;uv;cron}"     # tags voor in Proxmox
+var_cpu="${var_cpu:-1}"                    # CPU cores
+var_ram="${var_ram:-512}"                  # RAM in MB
+var_disk="${var_disk:-4}"                  # Disk in GB
+var_os="${var_os:-debian}"                 # debian/ubuntu/alpine
+var_version="${var_version:-13}"           # Debian 13
+var_unprivileged="${var_unprivileged:-1}"  # unprivileged LXC
 
 # ================== INTERACTIEVE VRAGEN ==================
 
@@ -31,6 +29,7 @@ while true; do
   read -rp "Naam/hostname voor de nieuwe container [${DEFAULT_HN}]: " INPUT_HN
   HN="${INPUT_HN:-$DEFAULT_HN}"
 
+  # eenvoudige validatie: letters, cijfers en koppeltekens, begint met letter/cijfer
   if [[ "$HN" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]]; then
     break
   else
@@ -39,13 +38,18 @@ while true; do
 done
 export HN
 
-# 1) Root wachtwoord
+# 1) Proxmox LXC root-wachtwoord genereren + eventueel overschrijven
 echo "Er wordt automatisch een sterk root-wachtwoord voor de LXC gegenereerd."
+# 20 tekens, letters/cijfers/symbolen
 GEN_ROOT_PW="$(tr -dc 'A-Za-z0-9!@#$%_-+=' </dev/urandom | head -c 20 || true)"
-[[ -z "$GEN_ROOT_PW" ]] && GEN_ROOT_PW="Pve$(date +%s%N | sha256sum | head -c 12)!"
+
+# fallback als om wat voor reden dan ook GEN_ROOT_PW leeg is
+if [[ -z "$GEN_ROOT_PW" ]]; then
+  GEN_ROOT_PW="Pve$(date +%s%N | sha256sum | head -c 12)!"
+fi
 
 echo
-echo "Voorgesteld root-wachtwoord:"
+echo "Voorgesteld root-wachtwoord voor de LXC:"
 echo "  $GEN_ROOT_PW"
 echo
 
@@ -69,6 +73,8 @@ while true; do
     fi
   fi
 done
+
+# NIET exporteren als var_pw / PW, zodat build.func het niet in pct create propt
 export ROOT_PW
 
 # Helper: multi-line geheim (deploy key) inlezen
@@ -94,11 +100,11 @@ prompt_multiline_secret() {
   printf -v "$varname" '%s' "$data"
 }
 
-# 2) GitHub repo / authenticatiemethode
+# 2) GitHub via PAT / HTTPS URL of via SSH deploy key
 echo
 echo "Repository toegang via GitHub:"
 echo
-echo "  [1] GitHub PAT of HTTPS-URL (bestaande methode)"
+echo "  [1] GitHub PAT of HTTPS-URL (https://github.com/user/repo.git)"
 echo "  [2] Deploy key (SSH) + SSH clone-URL (git@github.com:user/repo.git)"
 echo
 
@@ -116,11 +122,22 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
       echo "Je hebt gekozen voor: PAT / HTTPS-URL"
       echo
       while [[ -z "$GIT_REPO" ]]; do
+        echo
+        echo "Je kunt hier één van de twee opties gebruiken:"
+        echo
+        echo "  Voorbeeld 1 - ALLEEN PAT-string:"
+        echo "    github_pat_..."
+        echo
+        echo "  Voorbeeld 2 - Volledige HTTPS-URL met PAT:"
+        echo "    https://github_pat_...@github.com/user/repo.git"
+        echo
         read -rp "Voer je GitHub PAT of volledige HTTPS-URL in: " GIT_INPUT
 
+        # Alleen een PAT-string opgegeven?
         if [[ "$GIT_INPUT" == github_pat_* ]]; then
           GITHUB_PAT="$GIT_INPUT"
 
+          # Repo-naam vragen in vorm user/repo
           REPO_SLUG=""
           while [[ -z "$REPO_SLUG" ]]; do
             read -rp "Voer de repository-naam in als 'user/repo' (bijv. mijnuser/mijnrepo): " REPO_SLUG
@@ -135,6 +152,7 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
           echo "Gegenereerde HTTPS-URL op basis van PAT:"
           echo "  $GIT_REPO"
           echo
+
         else
           GIT_REPO="$GIT_INPUT"
           echo
@@ -153,7 +171,7 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
             GIT_REPO=""
           fi
         else
-          echo "Let op: 'git' is niet beschikbaar op de host, URL kan niet vooraf gevalideerd worden."
+          echo "Let op: 'git' is niet beschikbaar op de host, URL kan niet vooraf online gevalideerd worden."
         fi
       done
       ;;
@@ -161,7 +179,7 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
       GIT_AUTH_METHOD="ssh_deploy_key"
       echo
       echo "Je hebt gekozen voor: Deploy key (SSH)."
-      echo "Zorg dat de public key als *deploy key* in GitHub op de repo staat."
+      echo "Zorg dat de *publieke* key als deploy key op GitHub in de repo staat."
       echo
 
       while [[ -z "$GIT_REPO" ]]; do
@@ -171,7 +189,7 @@ while [[ -z "$GIT_AUTH_METHOD" ]]; do
         fi
       done
 
-      prompt_multiline_secret "private deploy key (begint met '-----BEGIN ... PRIVATE KEY-----')" DEPLOY_KEY
+      prompt_multiline_secret "PRIVATE deploy key (begint met '-----BEGIN ... PRIVATE KEY-----')" DEPLOY_KEY
 
       if [[ -z "$DEPLOY_KEY" ]]; then
         echo "Deploy key is leeg; kan niet doorgaan met SSH deploy key."
@@ -191,16 +209,15 @@ export GIT_AUTH_METHOD GIT_REPO DEPLOY_KEY_B64
 
 # Voor weergave in description: geen geheime info lekken
 REPO_DISPLAY="$GIT_REPO"
-if [[ "$GIT_AUTH_METHOD" == "https" && "$GIT_REPO" == https://github_pat_*@github.com/* ]]; then
-  # PAT afschermen
-  REPO_DISPLAY="https://github_pat_***@github.com/${GIT_REPO#https://github_pat_*@github.com/}"
+if [[ "$GIT_REPO" =~ ^https://github_pat_.*@github\.com/(.*)$ ]]; then
+  REPO_DISPLAY="https://github_pat_***@github.com/${BASH_REMATCH[1]}"
 fi
 
 # App specifieke defaults
-APP_DIR="${APP_DIR:-/opt/app}"
-PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}"
-UV_BIN="${UV_BIN:-/root/.local/bin/uv}"
+APP_DIR="${APP_DIR:-/opt/app}"                # map binnen de container
+PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"     # entrypoint in je repo
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}" # default: elke 6 uur
+UV_BIN="${UV_BIN:-/root/.local/bin/uv}"       # uv-binary pad
 
 echo
 echo "Samenvatting invoer:"
@@ -213,12 +230,13 @@ echo "  - Script          : $PYTHON_SCRIPT"
 echo "  - Cron schedule   : $CRON_SCHEDULE"
 echo
 
-# ================== STANDAARD COMMUNITY FLOW ==================
+# ================== STANDAARD COMMUNITY-SCRIPTS FLOW ==================
 header_info "$APP"
 variables
 color
 catch_errors
 
+# Optionele update-functie (standaard-stijl)
 function update_script() {
   header_info "$APP"
   if [[ ! -d /var ]]; then
@@ -233,7 +251,7 @@ function update_script() {
   exit 0
 }
 
-# ================== POST-INSTALL ==================
+# ================== POST-INSTALL: UV + GIT + CRON ==================
 post_install_python_uv() {
   msg_info "Configureer uv, GitHub repo en cron in CT ${CTID}"
 
@@ -243,7 +261,7 @@ post_install_python_uv() {
     # Basis packages
     apt-get update
     apt-get -y upgrade
-    apt-get install -y git curl python3 python3-distutils cron openssh-client
+    apt-get install -y git curl openssh-client python3 python3-distutils cron
 
     # uv installeren (indien nog niet aanwezig)
     if [ ! -x '$UV_BIN' ]; then
@@ -253,13 +271,13 @@ post_install_python_uv() {
     # Git auth configureren
     GIT_AUTH_METHOD='$GIT_AUTH_METHOD'
     REPO_URL='$GIT_REPO'
+    DEPLOY_KEY_B64='$DEPLOY_KEY_B64'
 
     if [ \"\$GIT_AUTH_METHOD\" = \"ssh_deploy_key\" ]; then
       echo \"[INFO] SSH deploy key configureren voor GitHub...\"
       mkdir -p /root/.ssh
       chmod 700 /root/.ssh
 
-      DEPLOY_KEY_B64='$DEPLOY_KEY_B64'
       printf '%s' \"\$DEPLOY_KEY_B64\" | base64 -d > /root/.ssh/id_ed25519
       chmod 600 /root/.ssh/id_ed25519
 
@@ -287,7 +305,12 @@ post_install_python_uv() {
 
     # Dependencies controleren en evt. syncen via uv
     if [ -f \"pyproject.toml\" ] || [ -f \"requirements.txt\" ] || [ -f \"requirements.in\" ]; then
-      echo \"[INFO] Dependency-bestanden gevonden in $APP_DIR, voer 'uv sync' uit...\"
+      echo \"[INFO] Dependency-bestanden gevonden in $APP_DIR:\"
+      [ -f \"pyproject.toml\" ]   && echo \"  - pyproject.toml\"
+      [ -f \"requirements.txt\" ] && echo \"  - requirements.txt\"
+      [ -f \"requirements.in\" ]  && echo \"  - requirements.in\"
+
+      echo \"[INFO] Voer 'uv sync' uit...\"
       '$UV_BIN' sync
     else
       echo \"[WARN] Geen pyproject.toml, requirements.txt of requirements.in gevonden in $APP_DIR\"
@@ -328,7 +351,6 @@ $CRON_SCHEDULE cd $APP_DIR && $UV_BIN sync && $UV_BIN run $PYTHON_SCRIPT >> /var
     sleep 3
   done
 
-  # Description zonder secrets
   if [[ -n "$IP" ]]; then
     pct set "$CTID" -description "Python uv cron container
 
@@ -356,6 +378,16 @@ Cron: $CRON_SCHEDULE"
 
 # ================== CONTAINER MAKEN EN CONFIGUREREN ==================
 start
-build_container          # Maakt de Debian LXC met DHCP (via build.func logica)
-description              # Standaard description (wordt later overschreven)
-post_install_python_uv_
+build_container          # Maakt de Debian 13 LXC met DHCP (via build.func logica)
+description              # Standaard description
+post_install_python_uv   # Onze extra stappen
+
+msg_ok "Completed Successfully!\n"
+echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
+echo -e "${INFO}${YW} Containernaam/hostname:${CL} ${GN}$HN${CL}"
+echo -e "${INFO}${YW} De container gebruikt DHCP voor zijn IP-adres.${CL}"
+echo -e "${INFO}${YW} Het IP-adres wordt getoond in:${CL}"
+echo -e "${TAB}${NETWORK}${GN}- Proxmox 'Summary / Algemene informatie' (Description)${CL}"
+echo -e "${TAB}${NETWORK}${GN}- /etc/motd binnen de container${CL}"
+echo
+echo -e "${INFO}${YW} Root-wachtwoord van de container:${CL} ${GN}$ROOT_PW${CL}"
