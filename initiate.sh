@@ -190,7 +190,7 @@ fi
 # App specifieke defaults
 APP_DIR="${APP_DIR:-/opt/app}"
 PYTHON_SCRIPT="${PYTHON_SCRIPT:-main.py}"
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 */6 * * *}"
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 7-22 * * *}"
 UV_BIN="${UV_BIN:-/root/.local/bin/uv}"
 
 echo
